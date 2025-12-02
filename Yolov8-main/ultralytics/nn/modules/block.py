@@ -1943,3 +1943,39 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+# --- 添加到 ultralytics/nn/modules/block.py 末尾 ---
+class DarknetBottleneck(nn.Module):
+    """
+    RemDet 中使用的 DarknetBottleneck
+    结构：1x1 Conv (降维) -> 3x3 Conv (升维/特征提取)
+    """
+    def __init__(self, c1, c2, w=1.0, shortcut=True, expansion=0.5):
+        super().__init__()
+        c_ = int(c2 * expansion)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class ChannelC2f(nn.Module):
+    """
+    RemDet: Rethinking Efficient Model Design for UAV Object Detection
+    ChannelC2f 模块，替换原版 C2f
+    """
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=1.0):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # 注意：RemDet 论文代码中这里 expansion 固定为 0.25
+        self.m = nn.ModuleList(DarknetBottleneck(self.c, self.c, shortcut=shortcut, expansion=0.25) for _ in range(n))
+
+    def forward(self, x):
+        # 这里的逻辑与 C2f 一致：切分 -> 堆叠 -> 拼接
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))

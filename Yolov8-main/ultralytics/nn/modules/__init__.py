@@ -59,6 +59,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    ChannelC2f,
 )
 from .conv import (
     CBAM,
@@ -75,6 +76,7 @@ from .conv import (
     LightConv,
     RepConv,
     SpatialAttention,
+    SPDConv,
 )
 from .head import (
     OBB,
@@ -179,4 +181,6 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
+    "SPDConv",
+    "ChannelC2f",
 )

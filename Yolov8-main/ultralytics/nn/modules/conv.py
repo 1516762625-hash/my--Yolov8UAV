@@ -24,6 +24,7 @@ __all__ = (
     "LightConv",
     "RepConv",
     "SpatialAttention",
+    "SPDConv"
 )
 
 
@@ -667,3 +668,24 @@ class Index(nn.Module):
             (torch.Tensor): Selected tensor.
         """
         return x[self.index]
+
+# --- 在 ultralytics/nn/modules/conv.py 中添加 ---
+
+class SPDConv(nn.Module):
+    """
+    Space-to-Depth Convolution (SPD-Conv)
+    References: https://arxiv.org/abs/2206.02633
+    """
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        # SPD将宽高减半(downsample x2)，通道数x4。
+        # 所以输入的通道变成了 c1 * 4
+        # 这里的卷积层 stride 必须为 1，因为降采样已经通过切片完成了
+        self.conv = Conv(c1 * 4, c2, k, 1, p, g, d, act)
+
+    def forward(self, x):
+        # Space-to-Depth 切片操作
+        # 将 feature map 分割成 4 个子图并在通道维度拼接
+        x = torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2],
+                       x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
+        return self.conv(x)

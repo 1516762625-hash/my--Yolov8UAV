@@ -105,13 +105,69 @@ class DFLoss(nn.Module):
         ).mean(-1, keepdim=True)
 
 
+# 2. 在 BboxLoss 类之前定义 WIoU v3 计算函数 (推荐这种方式，不依赖 metrics.py)
+def get_wiou_v3(pred, target, iou_mean=None):
+    """
+    Wise-IoU v3 Loss
+    pred: [N, 4] (x1,y1,x2,y2)
+    target: [N, 4] (x1,y1,x2,y2)
+    """
+    eps = 1e-7
+    # 坐标解析
+    pred_x1, pred_y1, pred_x2, pred_y2 = pred.chunk(4, -1)
+    target_x1, target_y1, target_x2, target_y2 = target.chunk(4, -1)
+
+    # IoU 计算
+    inter_x1 = torch.max(pred_x1, target_x1)
+    inter_y1 = torch.max(pred_y1, target_y1)
+    inter_x2 = torch.min(pred_x2, target_x2)
+    inter_y2 = torch.min(pred_y2, target_y2)
+    inter_area = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+
+    pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
+    target_area = (target_x2 - target_x1) * (target_y2 - target_y1)
+    union_area = pred_area + target_area - inter_area + eps
+    iou = inter_area / union_area
+
+    # 距离关注度 (Distance Attention)
+    # 最小外接矩形尺寸
+    cw = torch.max(pred_x2, target_x2) - torch.min(pred_x1, target_x1)
+    ch = torch.max(pred_y2, target_y2) - torch.min(pred_y1, target_y1)
+    c2 = cw ** 2 + ch ** 2 + eps
+
+    # 中心点距离
+    rho2 = ((pred_x1 + pred_x2 - target_x1 - target_x2) ** 2 +
+            (pred_y1 + pred_y2 - target_y1 - target_y2) ** 2) / 4
+
+    # WIoU v1: 距离惩罚项
+    dist_penalty = torch.exp(rho2 / c2)
+    loss_v1 = (1 - iou) * dist_penalty
+
+    # WIoU v3: 动态非单调聚焦系数 (Dynamic Non-monotonic Focusing)
+    # 如果提供了 iou_mean (移动平均 IoU)，则启用 v3
+    if iou_mean is not None:
+        # alpha=1.9, delta=3 是论文推荐参数
+        r = torch.exp((loss_v1.detach() / (1 - iou_mean)).clamp(min=1) * -1.9 * (loss_v1.detach() - (1 - iou_mean)) / 3)
+        return loss_v1 * r
+    else:
+        # 否则降级为 WIoU v1
+        return loss_v1
+
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16):
-        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+    def __init__(self, reg_max, use_dfl=False):
         super().__init__()
-        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.reg_max = reg_max
+        self.use_dfl = use_dfl
+
+        # === 修复这里：初始化 DFLoss 实例 ===
+        # 如果 use_dfl 为 True，则实例化 DFLoss，否则为 None
+        self.dfl_loss = DFLoss(reg_max) if use_dfl else None
+
+        # --- 新增：初始化 IoU 均值记录器 ---
+        self.iou_mean = 1.0
+        self.momentum = 1 - 0.5 ** (1 / 7000)  # 动量更新参数
 
     def forward(
         self,
@@ -125,8 +181,30 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # IoU loss (原始代码通常是下面这样)
+        # iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        # loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+
+        # === 修改开始：替换为 WIoU v3 ===
+
+        # 1. 获取预测框和真实框
+        p_box = pred_bboxes[fg_mask]
+        t_box = target_bboxes[fg_mask]
+
+        # 2. 计算当前批次的 IoU (用于更新均值)
+        # 这里为了方便更新均值，我们先算个普通 IoU
+        iou_curr = bbox_iou(p_box, t_box, xywh=False, CIoU=False)  # 只算基础 IoU
+
+        # 3. 更新全局 IoU 均值 (Running Mean)
+        if self.training:
+            self.iou_mean = (1 - self.momentum) * self.iou_mean + self.momentum * iou_curr.detach().mean().item()
+
+        # 4. 计算 WIoU v3 Loss
+        # 这里的函数就是我们上面新加的 get_wiou_v3
+        wiou_loss = get_wiou_v3(p_box, t_box, iou_mean=self.iou_mean)
+
+        loss_iou = (wiou_loss * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
@@ -211,7 +289,7 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max, self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:

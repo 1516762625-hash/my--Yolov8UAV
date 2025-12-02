@@ -146,6 +146,75 @@ def bbox_iou(
     return iou  # IoU
 
 
+class WIoU_Scale:
+    '''
+    Wise-IoU v3 动态聚焦机制
+    '''
+    monotonous = False
+    _momentum = 1 - 0.5 ** (1 / 7000)
+
+    def __init__(self, iou):
+        self.iou = iou
+        self._update(self.iou)
+
+    def _update(self, iou):
+        import torch
+        # 计算平均 IoU，用于后续动态缩放
+        self.iou_mean = (1 - self._momentum) * self.iou_mean + self._momentum * iou.detach().mean() if hasattr(self,
+                                                                                                               'iou_mean') else iou.detach().mean()
+
+    def __call__(self, iou, *args, **kwargs):
+        # 动态计算聚焦系数 r
+        # alpha 和 delta 是超参数，通常 alpha=1.9, delta=3
+        return torch.exp((iou.detach() / self.iou_mean).clamp(min=1) * -1.9 * (iou.detach() - self.iou_mean) / 3)
+
+
+def bbox_wjou(box1, box2, xywh=True, eps=1e-7):
+    '''
+    计算 Wise-IoU v3
+    '''
+    # 1. 基础 IoU 计算 (复用原有逻辑或简化版)
+    if xywh:  # transform from xywh to xyxy
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1 / 2, x1 + w1 / 2, y1 - h1 / 2, y1 + h1 / 2
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2 / 2, x2 + w2 / 2, y2 - h2 / 2, y2 + h2 / 2
+    else:  # x1, y1, x2, y2
+        b1_x1, b1_x2, b1_y1, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_x2, b2_y1, b2_y2 = box2.chunk(4, -1)
+
+    # Intersection area
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+
+    # Union Area
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    # 2. 计算 Distance (中心点距离)
+    cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex width
+    ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
+    c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
+
+    # 中心点坐标
+    b1_x_center, b1_y_center = (b1_x1 + b1_x2) / 2, (b1_y1 + b1_y2) / 2
+    b2_x_center, b2_y_center = (b2_x1 + b2_x2) / 2, (b2_y1 + b2_y2) / 2
+
+    rho2 = ((b2_x_center - b1_x_center) ** 2 + (b2_y_center - b1_y_center) ** 2)
+
+    # 3. WIoU v1 部分
+    dist = torch.exp(rho2 / c2)
+    wiou_v1 = dist * iou
+
+    # 4. WIoU v3 部分 (引入动态聚焦系数 r)
+    # 注意：这里需要实例化一个全局的 scale scaler，或者在 Loss 内部调用
+    # 为了简化，这里我们只返回 Loss 组件，把动态计算放到 Loss.py 里更方便
+    # 或者直接在这里返回最终的 loss = (1 - iou) * dist * r
+
+    return iou, dist  # 返回 iou 和 距离惩罚项，具体 v3 计算在 loss.py 组装
+
+
 def mask_iou(mask1: torch.Tensor, mask2: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """Calculate masks IoU.
 
