@@ -1,8 +1,0 @@
-__pycache__/
-input/
-runs/
-.vscode/
-input/
-runs/
-yolov9*.pt
-gelan*.pt
