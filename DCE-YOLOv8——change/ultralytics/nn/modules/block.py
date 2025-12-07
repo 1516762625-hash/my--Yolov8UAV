@@ -1970,10 +1970,18 @@ class DCE(nn.Module):
         # 计算保留的通道数 (c_residual)
         self.c_residual = c1 - self.c_processed
 
+        # 1. 记录步长
+        self.stride = s
+        # 2. 如果步长大于1，定义一个池化层给残差分支用
+        if self.stride > 1:
+            self.pool = nn.MaxPool2d(kernel_size=s, stride=s)
+        else:
+            self.pool = nn.Identity()
+
         # 论文 Figure 4 显示：处理分支包含两个连续的 3x3 卷积
         # 这里的输出通道保持与输入一致，方便后续拼接
-        self.cv1 = Conv(self.c_processed, self.c_processed, k, s, p, g, act)
-        self.cv2 = Conv(self.c_processed, self.c_processed, k, s, p, g, act)
+        self.cv1 = Conv(self.c_processed, self.c_processed, k, s, p, g, 1, act)
+        self.cv2 = Conv(self.c_processed, self.c_processed, k, 1, p, g, 1, act)
 
         # 如果输入通道 c1 不等于输出通道 c2，或者拼接后的通道数不匹配，
         # 我们添加一个 1x1 卷积来调整通道数，保证模块的通用性
@@ -1990,6 +1998,11 @@ class DCE(nn.Module):
         # 2. Sequential Conv: 对 3/4 的特征进行两次卷积提取上下文
         x_p = self.cv1(x_p)
         x_p = self.cv2(x_p)
+
+        # Branch 2: Residual (残差处理)
+        # 如果做了下采样，残差部分也要跟着变小
+        if self.stride > 1:
+            x_r = self.pool(x_r)
 
         # 3. Fusion: 拼接处理后的特征和原始特征
         out = torch.cat((x_p, x_r), dim=1)
