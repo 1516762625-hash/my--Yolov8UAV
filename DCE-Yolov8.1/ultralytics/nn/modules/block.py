@@ -1503,50 +1503,19 @@ class C2fPSA(C2f):
 
 
 class SCDown(nn.Module):
-    """SCDown module for downsampling with separable convolutions.
-
-    This module performs downsampling using a combination of pointwise and depthwise convolutions, which helps in
-    efficiently reducing the spatial dimensions of the input tensor while maintaining the channel information.
-
-    Attributes:
-        cv1 (Conv): Pointwise convolution layer that reduces the number of channels.
-        cv2 (Conv): Depthwise convolution layer that performs spatial downsampling.
-
-    Methods:
-        forward: Applies the SCDown module to the input tensor.
-
-    Examples:
-        >>> import torch
-        >>> from ultralytics import SCDown
-        >>> model = SCDown(c1=64, c2=128, k=3, s=2)
-        >>> x = torch.randn(1, 64, 128, 128)
-        >>> y = model(x)
-        >>> print(y.shape)
-        torch.Size([1, 128, 64, 64])
     """
-
-    def __init__(self, c1: int, c2: int, k: int, s: int):
-        """Initialize SCDown module.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            k (int): Kernel size.
-            s (int): Stride.
-        """
+    Spatial Context Downsampling (SCDown) - Paper Implementation
+    Uses Depthwise Separable Convolution for downsampling.
+    Structure: Depthwise(k=3, s=2) -> Pointwise(k=1)
+    """
+    def __init__(self, c1, c2, k=3, s=2):
         super().__init__()
-        self.cv1 = Conv(c1, c2, 1, 1)
-        self.cv2 = Conv(c2, c2, k=k, s=s, g=c2, act=False)
+        # 1. Depthwise Conv: 负责下采样，组数=输入通道数 (g=c1)
+        self.cv1 = Conv(c1, c1, k, s, g=c1, act=False)
+        # 2. Pointwise Conv: 负责升维/改变通道
+        self.cv2 = Conv(c1, c2, 1, 1, act=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply convolution and downsampling to the input tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            (torch.Tensor): Downsampled output tensor.
-        """
+    def forward(self, x):
         return self.cv2(self.cv1(x))
 
 
@@ -1947,105 +1916,68 @@ class SAVPE(nn.Module):
 
 class DCE(nn.Module):
     """
-    Divided Context Extraction (DCE) Module from DCE-YOLOv8 paper.
-    Designed for drone vision to extract features of small objects efficiently.
+    Divided Context Extraction (DCE) - Paper Implementation
+    Uses Depthwise Convolution to extract features from 3/4 of the channels.
     """
 
     def __init__(self, c1, c2, k=3, s=1, p=None, g=1, act=True):
-        """
-        Args:
-            c1 (int): 输入通道数 (Input channels)
-            c2 (int): 输出通道数 (Output channels)
-            k (int): 卷积核大小 (Kernel size)
-            s (int): 步长 (Stride)
-            p (int): 填充 (Padding)
-            g (int): 分组卷积 (Groups)
-            act (bool): 激活函数 (Activation)
-        """
         super().__init__()
-        self.ratio = 0.75  # 论文中设定 3/4 的特征进行卷积处理
-
-        # 计算被处理的通道数 (c_processed)
+        self.ratio = 0.75
         self.c_processed = int(c1 * self.ratio)
-        # 计算保留的通道数 (c_residual)
         self.c_residual = c1 - self.c_processed
 
-        # 1. 记录步长
-        self.stride = s
-        # 2. 如果步长大于1，定义一个池化层给残差分支用
-        if self.stride > 1:
-            self.pool = nn.MaxPool2d(kernel_size=s, stride=s)
-        else:
-            self.pool = nn.Identity()
+        # 论文要求 DCE 只提取特征，不下采样 (stride=1)
+        # 使用 Depthwise (g=c_processed) 来极致压缩参数
+        self.cv1 = Conv(self.c_processed, self.c_processed, k, 1, p, g=self.c_processed, act=act)
+        self.cv2 = Conv(self.c_processed, self.c_processed, k, 1, p, g=self.c_processed, act=act)
 
-        # 论文 Figure 4 显示：处理分支包含两个连续的 3x3 卷积
-        # 这里的输出通道保持与输入一致，方便后续拼接
-        self.cv1 = Conv(self.c_processed, self.c_processed, k, s, p, g, 1, act)
-        self.cv2 = Conv(self.c_processed, self.c_processed, k, 1, p, g, 1, act)
-
-        # 如果输入通道 c1 不等于输出通道 c2，或者拼接后的通道数不匹配，
-        # 我们添加一个 1x1 卷积来调整通道数，保证模块的通用性
+        # 投影层：只有当输入输出通道不一致时才需要
         if c1 != c2:
             self.project = Conv(c1, c2, 1, 1)
         else:
             self.project = None
 
     def forward(self, x):
-        # 1. Split: 按通道分割特征图
-        # x_p: processed part (3/4), x_r: residual part (1/4)
+        # 1. Split
         x_p, x_r = torch.split(x, [self.c_processed, self.c_residual], dim=1)
 
-        # 2. Sequential Conv: 对 3/4 的特征进行两次卷积提取上下文
-        x_p = self.cv1(x_p)
-        x_p = self.cv2(x_p)
+        # 2. Process (Depthwise)
+        x_p = self.cv2(self.cv1(x_p))
 
-        # Branch 2: Residual (残差处理)
-        # 如果做了下采样，残差部分也要跟着变小
-        if self.stride > 1:
-            x_r = self.pool(x_r)
-
-        # 3. Fusion: 拼接处理后的特征和原始特征
+        # 3. Concat
         out = torch.cat((x_p, x_r), dim=1)
 
-        # 4. Projection: 如果需要，调整输出通道数
         return self.project(out) if self.project else out
 
 
 class ERB(nn.Module):
     """
-    Efficient Residual Bottleneck (ERB) from DCE-YOLOv8 paper.
-    Replaces the C2f module to reduce parameters and computation.
-    Structure: Input -> Conv(1x1) -> [Bottleneck x N] -> Conv(1x1) + Input
+    Efficient Residual Bottleneck (ERB) - Ultra Light Version
+    Paper Structure: Conv1x1 -> [Depthwise Bottleneck] -> Conv1x1 -> Add
     """
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        """
-        Args:
-            c1 (int): 输入通道数
-            c2 (int): 输出通道数
-            n (int): 堆叠的 Bottleneck 数量 (论文中通常设为 1 或 2)
-            shortcut (bool): 是否使用残差连接
-            g (int): 分组卷积组数
-            e (float): 膨胀/压缩系数 (Expansion ratio). 论文为了轻量化，通常设为 0.5 或更小
-        """
         super().__init__()
-        c_ = int(c2 * e)  # 中间隐藏层通道数 (Hidden channels)
+        self.c = int(c2 * e)  # 中间层通道数
 
-        # 1. 降维 (1x1 Conv)
-        self.cv1 = Conv(c1, c_, 1, 1)
+        # 1. 降维 (1x1)
+        self.cv1 = Conv(c1, self.c, 1, 1)
 
-        # 2. 堆叠 N 个 Bottleneck (利用 Ultralytics 自带的 Bottleneck 类)
-        # 注意：这里的 Bottleneck 内部通常是 3x3 Conv
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        # 2. 核心特征提取: 手动构建深度可分离卷积的 Bottleneck
+        # 这里的关键是 g=self.c，强制使用 Depthwise 卷积
+        self.m = nn.Sequential(*(
+            nn.Sequential(
+                Conv(self.c, self.c, 3, 1, g=self.c),  # Depthwise
+                Conv(self.c, self.c, 1, 1)  # Pointwise
+            ) for _ in range(n)
+        ))
 
-        # 3. 升维/恢复 (1x1 Conv)
-        self.cv2 = Conv(c_, c2, 1, 1)
+        # 3. 升维 (1x1)
+        self.cv2 = Conv(self.c, c2, 1, 1)
 
-        # 4. 残差连接 (Residual Connection)
-        # 只有当输入输出通道数一致且 shortcut=True 时才相加
+        # 4. 残差连接条件
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        # 核心公式: Output = Conv1x1( Bottlenecks( Conv1x1(x) ) ) + x
-        y = self.cv2(self.m(self.cv1(x)))
-        return x + y if self.add else y
+        out = self.cv2(self.m(self.cv1(x)))
+        return x + out if self.add else out
