@@ -1,0 +1,51 @@
+# YOLOv8-Mamba-Drone Corrected Configuration
+# Authors: DCE-YOLOv8 Logic + Mamba(VSS) + P2 Head
+nc: 10  # VisDrone class count
+scales:
+  n: [0.33, 1.00, 1024] # Width=1.00 确保参数量对齐 4.8M
+
+backbone:
+  # [from, repeats, module, args]
+  
+  # --- P1/2 (Stride 2) ---
+  - [-1, 1, Conv, [64, 3, 2]]  # 0
+  - [-1, 1, DCE, [64]]         # 1
+  
+  # --- P2/4 (Stride 4) ---
+  - [-1, 1, Conv, [128, 3, 2]] # 2 (Downsample to P2)
+  - [-1, 1, DCE, [128]]        # 3 (Feature P2)
+  - [-1, 1, ERB, [128, 1]]     # 4 (Refine P2) -> 供 Head 拼接使用 (Concat Index)
+  
+  # --- P3/8 (Stride 8) ---
+  - [-1, 1, SCDown, [256, 3, 2]] # 5 (Downsample P2->P3) 【修复点：显式下采样】
+  - [-1, 2, ERB, [256, 2]]       # 6 (Refine P3) -> 供 Head 拼接使用 (Concat Index)
+  
+  # --- P4/16 (Stride 16) ---
+  - [-1, 1, SCDown, [512, 3, 2]] # 7 (Downsample P3->P4)
+  - [-1, 1, C2f_VSS, [512, 1]]   # 8 (Mamba Layer: 全局语义) -> Backbone Output
+  - [-1, 1, SPPF, [512, 5]]      # 9 (Spatial Pyramid)
+
+head:
+  # --- Top-down: P4 -> P3 ---
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 10
+  - [[-1, 6], 1, Concat, [1]]                  # 11 (拼接 Backbone P3 - Layer 6)
+  - [-1, 1, ERB, [256, 1]]                     # 12 (Head P3)
+
+  # --- Top-down: P3 -> P2 (微小目标关键层) ---
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # 13
+  - [[-1, 4], 1, Concat, [1]]                  # 14 (拼接 Backbone P2 - Layer 4)
+  - [-1, 1, ERB, [128, 1]]                     # 15 (Head P2) -> Detect Output 1 (Tiny)
+
+  # --- Bottom-up: P2 -> P3 ---
+  - [-1, 1, SCDown, [256, 3, 2]]               # 16 (Downsample)
+  - [[-1, 12], 1, Concat, [1]]                 # 17 (拼接 Head P3 - Layer 12)
+  - [-1, 1, ERB, [256, 1]]                     # 18 (Refine P3) -> Detect Output 2 (Small)
+
+  # --- Bottom-up: P3 -> P4 ---
+  - [-1, 1, SCDown, [512, 3, 2]]               # 19 (Downsample)
+  - [[-1, 9], 1, Concat, [1]]                  # 20 (拼接 Backbone P4 - Layer 9)
+  # 【建议】Head 的深层也用 Mamba，进一步增强语义
+  - [-1, 1, C2f_VSS, [512, 1]]                 # 21 (Refine P4) -> Detect Output 3 (Medium)
+
+  # Detect Head
+  - [[15, 18, 21], 1, Detect, [nc]]

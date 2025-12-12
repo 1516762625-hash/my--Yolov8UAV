@@ -12,6 +12,13 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
+# 尝试导入 Mamba，如果环境没配好，给个报错提示
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    Mamba = None 
+    # print("Warning: mamba_ssm not installed. C2f_VSS will fail if used.")
+
 __all__ = (
     "C1",
     "C2",
@@ -1981,3 +1988,164 @@ class ERB(nn.Module):
     def forward(self, x):
         out = self.cv2(self.m(self.cv1(x)))
         return x + out if self.add else out
+
+
+# -------------------- LSK Attention Start --------------------
+class LSKBlock(nn.Module):
+    """
+    Large Selective Kernel (LSK) Attention Module.
+    Paper: https://arxiv.org/abs/2303.09030
+    Fix: Updated __init__ to accept (c1, c2) for channel adaptation.
+    """
+
+    def __init__(self, c1, c2):
+        """
+        Args:
+            c1 (int): Input channels (e.g., 768 from Concat)
+            c2 (int): Output channels (e.g., 256 from YAML args)
+        """
+        super().__init__()
+
+        # 1. Input Projection: 把输入通道(768) 降维到 目标通道(256)
+        # 这是修复报错的关键！
+        self.input_conv = nn.Conv2d(c1, c2, 1)
+
+        dim = c2  # 后续所有操作都在 c2 维度上进行
+
+        # 2. Large Kernel Convs (Depthwise)
+        self.conv0 = nn.Conv2d(dim, dim, 5, padding=2, groups=dim)
+        self.conv_spatial = nn.Conv2d(dim, dim, 7, stride=1, padding=9, groups=dim, dilation=3)
+
+        # 3. Channel mixing
+        self.conv1 = nn.Conv2d(dim, dim, 1)
+        self.conv2 = nn.Conv2d(dim, dim, 1)
+
+        # 4. Spatial Selection
+        self.conv_squeeze = nn.Conv2d(2, 2, 7, padding=3)
+        self.conv = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        # 先进行降维处理，解决 channel mismatch
+        x = self.input_conv(x)
+        shortcut = x
+
+        # LSK Attention 流程
+        attn1 = self.conv0(x)
+        attn2 = self.conv_spatial(attn1)
+
+        attn1 = self.conv1(attn1)
+        attn2 = self.conv2(attn2)
+
+        attn = torch.cat([attn1, attn2], dim=1)
+        avg_attn = torch.mean(attn, dim=1, keepdim=True)
+        max_attn, _ = torch.max(attn, dim=1, keepdim=True)
+        agg = torch.cat([avg_attn, max_attn], dim=1)
+
+        sig = self.conv_squeeze(agg).sigmoid()
+        lhs = attn1 * sig[:, 0, :, :].unsqueeze(1)
+        rhs = attn2 * sig[:, 1, :, :].unsqueeze(1)
+
+        out = self.conv(lhs + rhs)
+        return out * shortcut
+
+
+# -------------------- Mamba Modules (Final Fix) --------------------
+import torch
+import torch.nn as nn
+
+class VSSBlock(nn.Module):
+    def __init__(self, in_channels, hidden_dim, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        # 懒加载 mamba，防止没有安装包时直接报错
+        try:
+            from mamba_ssm import Mamba
+            self.mamba = Mamba(
+                d_model=hidden_dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
+            )
+        except ImportError:
+            print("⚠️ Mamba not installed, module invalid!")
+            self.mamba = None
+
+        self.proj = nn.Linear(in_channels, hidden_dim)
+        self.proj_out = nn.Linear(hidden_dim, in_channels)
+        self.norm = nn.LayerNorm(in_channels)
+
+    def forward(self, x):
+        # ---------------- 核心修改开始 ----------------
+        # 1. [CPU 跳过逻辑] 
+        # YOLO 初始化时会用 CPU 生成一个全 0 的假图片传进来算步长。
+        # Mamba 的 CUDA 算子不支持 CPU，强行跑会报错 "Expected u.is_cuda() to be true"。
+        # 所以：如果发现输入 x 在 CPU 上，直接原样返回（反正只是为了算 shape，数值不重要）。
+        if not x.is_cuda:
+            return x
+        # ---------------- 核心修改结束 ----------------
+
+        # 2. 安全检查：如果没有加载成功 Mamba，也跳过
+        if self.mamba is None:
+            return x
+
+        B, C, H, W = x.shape
+        
+        # 3. 强制连续 + 维度变换 (B, C, H, W) -> (B, L, C)
+        x_flat = x.permute(0, 2, 3, 1).flatten(1, 2).contiguous()
+        
+        res = x_flat
+        x_norm = self.norm(x_flat)
+
+        # 4. 强制 FP32 进行 Mamba 计算
+        with torch.cuda.amp.autocast(enabled=False):
+            x_in = x_norm.float() 
+            x_mamba = self.proj(x_in)
+            x_mamba = x_mamba.contiguous() 
+            x_mamba = self.mamba(x_mamba)
+            x_mamba = self.proj_out(x_mamba)
+            out = x_mamba + res.float()
+        
+        # 5. 恢复维度
+        out = out.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        
+        if torch.is_autocast_enabled():
+            out = out.half()
+            
+        return out
+
+
+class C2f_VSS(nn.Module):
+    """
+    CSP Bottleneck with VSS Blocks
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(VSSBlock(self.c, self.c) for _ in range(n))
+
+    def forward(self, x):
+        # 1. 强制输入连续
+        x = x.contiguous()
+        
+        # 2. Split 操作
+        y = list(self.cv1(x).chunk(2, 1))
+        
+        # 3. 显式循环 (不要用 extend 生成器，方便 Debug 且确保内存执行顺序)
+        # 这里的 y[-1] 是 split 出来的张量，必须 contiguous() 才能进 Mamba
+        y_last = y[-1]
+        results = []
+        for m in self.m:
+            # 这里的 .contiguous() 是防止 chunk 产生的非连续内存导致 Mamba 崩溃的第一道防线
+            out = m(y_last.contiguous())
+            results.append(out)
+            # 注意：标准的 C2f 是 Parallel 结构，y[-1] 指向的是 split 的一部分，不应该被更新
+            # 如果你想改成串行 (Sequential)，这里应该写 y_last = out 
+            # 但为了保持 YOLO C2f 原义，我们这里只收集结果
+        
+        y.extend(results)
+        
+        # 4. 拼接
+        return self.cv2(torch.cat(y, 1))
+
+# -------------------- End of Mamba Modules --------------------

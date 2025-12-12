@@ -70,6 +70,8 @@ from ultralytics.nn.modules import (
     v10Detect,
     DCE,
     ERB,
+    LSKBlock,
+    C2f_VSS,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1557,6 +1559,8 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
             DCE,
             ERB,
+            LSKBlock,
+            C2f_VSS,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments

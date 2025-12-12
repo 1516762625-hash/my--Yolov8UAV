@@ -61,6 +61,8 @@ from .block import (
     TorchVision,
     DCE,
     ERB,
+    LSKBlock,
+    C2f_VSS,
 )
 from .conv import (
     CBAM,
