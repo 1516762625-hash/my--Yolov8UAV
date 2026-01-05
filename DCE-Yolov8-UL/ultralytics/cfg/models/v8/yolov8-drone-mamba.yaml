@@ -1,0 +1,59 @@
+# YOLOv8-640-StrongV1: DCE + SCDown + (Mamba@P4) + LSK + 3-scale Detect (P2/P3/P4)
+# Rationale for imgsz=640: drop P1 head (can add FP/noise), strengthen P2 capacity
+nc: 10
+scales:
+  n: [0.33, 1.00, 1024]       # 模型尺度系数
+  # Ultralytics 的 “scale” 写法：[depth_multiple, width_multiple, max_channels]。这里表示：
+  # depth_multiple=0.33：所有层里写的 repeats 会按这个系数缩放（比如 repeats=3 可能会变成 1）
+  # width_multiple=1.00：通道数不缩放
+  # max_channels=1024：最大通道上限
+
+  # YAML 每一行格式：[from, repeats, module, args]
+  # from=-1 表示上一层输出
+  # repeats 表示重复次数（会乘 depth_multiple）
+  # module 是模块名
+  # args 是参数（通常第一个是输出通道）
+
+backbone:
+  # P1/2
+  - [-1, 1, Conv, [64, 3, 2]]                 # k=3×3 stride=2，下采样一半；输出 64 通道。对应 P1/2 特征。
+  - [-1, 1, DCE, [64]]                        # 在最浅层下采样后立刻用 DCE 做特征增强。
+
+  # P2/4
+  - [-1, 1, Conv, [128, 3, 2]]                # 再下采样到 1/4（P2），通道 128。
+  - [-1, 1, DCE, [128]]                       # 继续用 DCE 做特征增强。
+  - [-1, 3, C2f, [128, True]]                 # 4  ★ P2 backbone
+
+  # P3/8
+  - [-1, 1, SCDown, [256, 3, 2]]              # 使用SCDown模块代替普通的下采样卷积目的，是为了在下采样的同时减少计算量并保留更多的空间上下文信息。
+  - [-1, 3, C2f, [256, True]]                 # 6  ★ P3 backbone (local, no Mamba)
+
+  # P4/16
+  - [-1, 1, SCDown, [512, 3, 2]]              # 下采样到 1/16（P4），通道 512
+  - [-1, 3, C2f_VSS, [512, 1]]                # 8  ★ Mamba only at deep stage
+  - [-1, 1, SPPF, [512, 5]]                   # 9  ★ P4 backbone
+
+head:
+  # P4 -> P3
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]     # 10
+  - [[-1, 6], 1, Concat, [1]]                      # 11
+  - [-1, 1, LSKBlock, [256]]                       # 12
+  - [-1, 2, C2f, [256, True]]                      # 13  ★ P3 td
+
+  # P3 -> P2 (stronger P2)
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]     # 14
+  - [[-1, 4], 1, Concat, [1]]                      # 15
+  - [-1, 3, C2f, [192, True]]                      # 16  ★ P2 td (wider)
+
+  # P2 -> P3
+  - [-1, 1, SCDown, [256, 3, 2]]                   # 17
+  - [[-1, 13], 1, Concat, [1]]                     # 18
+  - [-1, 2, C2f, [256, True]]                      # 19  ★ P3 out
+
+  # P3 -> P4
+  - [-1, 1, SCDown, [512, 3, 2]]                   # 20
+  - [[-1, 9], 1, Concat, [1]]                      # 21
+  - [-1, 1, Conv, [512, 1, 1]]                     # 22
+  - [-1, 2, C2f_VSS, [512, 1]]                     # 23  ★ P4 out (Mamba)
+
+  - [[16, 19, 23], 1, Detect, [nc]]                # 24
