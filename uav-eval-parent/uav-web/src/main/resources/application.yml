@@ -1,0 +1,23 @@
+server:
+  port: 8080 # Web服务端口
+
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    # 注意修改为你的数据库密码，时区设为上海
+    url: jdbc:mysql://localhost:3306/uav_eval_db?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf-8
+    username: root
+    password: 123456
+
+# MyBatisPlus 全局终极配置 (复习核心知识点)
+mybatis-plus:
+  configuration:
+    # 开启控制台SQL日志打印，方便你观察底层是不是真的走了逻辑删除和条件拼接
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: assign_id           # 全局设置主键生成策略为雪花算法 (解决长ID问题)
+      table-prefix: tbl_           # 全局设置表前缀，这样生成的实体类直接叫 Dataset 而不是 TblDataset
+      logic-delete-field: deleted  # 全局指定逻辑删除的字段名
+      logic-not-delete-value: 0    # 逻辑未删除的值 (0代表正常)
+      logic-delete-value: 1        # 逻辑删除的值 (1代表被删)
